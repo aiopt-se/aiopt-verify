@@ -6,7 +6,10 @@ software signs each record with its key (pubkey.pem). The second party, in a
 pilot the operator, adds its own signature with this tool, using a key that
 never leaves its machine. AIOpt then seals the pack, and the free verifier
 (aiopt_verify.py) requires both signatures on every record, so neither party
-alone can produce a record that verifies.
+alone can produce a record that verifies. It also writes your signed
+statement of what you co-signed (record count, last record, ledger digest)
+into the pack as cosign_statement.json, so anyone can check with the free
+verifier that no record was removed after you signed.
 
 This tool shares no code with AIOpt. Before it signs anything it re-derives
 every hash and checks AIOpt's signature on every record, so you only co-sign
@@ -45,6 +48,7 @@ except ImportError:
 
 ZERO_HASH = "0" * 64
 RECEIPT_SCHEMA = "aiopt_cosign_receipt_v1"
+STATEMENT_SCHEMA = "aiopt_cosign_statement_v1"
 
 
 class Refused(Exception):
@@ -182,6 +186,11 @@ def sign(pack, key_path, receipt_path=None, assume_yes=False, out=print):
         "pubkey_fingerprint": fingerprint(system_pub),
         "cosigner_fingerprint": fingerprint(pub),
     }
+    # The same facts, signed again and left in the pack for any verifier: AIOpt
+    # signs the manifest alone, so without this a shortened pack could be resealed.
+    stmt = {**core, "schema": STATEMENT_SCHEMA}
+    stmt["statement_signature"] = base64.b64encode(key.sign(canon(stmt))).decode("ascii")
+    (pack / "cosign_statement.json").write_text(json.dumps(stmt, indent=2, sort_keys=True) + "\n")
     receipt = {**core, "receipt_signature": base64.b64encode(key.sign(canon(core))).decode("ascii")}
     rp = Path(receipt_path or f"aiopt_cosign_receipt_{core['head_hash'][:12]}.json")
     rp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
@@ -215,6 +224,17 @@ def check(pack, receipt_path, out=print):
     item("same_head_hash", manifest.get("head_hash") == receipt.get("head_hash"))
     item("same_ledger", manifest.get("ledger_sha256") == receipt.get("ledger_sha256")
          and sha256_hex((pack / "ledger.jsonl").read_bytes()) == receipt.get("ledger_sha256"))
+    stmt_path = pack / "cosign_statement.json"
+    stmt = json.loads(stmt_path.read_text()) if stmt_path.exists() else {}
+    stmt_core = {k: v for k, v in stmt.items() if k != "statement_signature"}
+    try:
+        actor_pub.verify(base64.b64decode(stmt["statement_signature"]), canon(stmt_core))
+        signed = True
+    except (InvalidSignature, KeyError, ValueError):
+        signed = False
+    item("your_statement_in_pack", signed and stmt_core.get("schema") == STATEMENT_SCHEMA and all(
+        stmt_core.get(k) == receipt.get(k)
+        for k in ("record_count", "head_hash", "ledger_sha256", "cosigner_fingerprint")))
     for name, ok in results:
         out(f"  [{'PASS' if ok else 'FAIL'}] {name}")
     ok = all(passed for _, passed in results)

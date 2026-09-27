@@ -158,6 +158,35 @@ def test_receipt_catches_a_pack_cut_short_after_cosigning(tmp_path, cosign_key):
     assert not c.check(pack, tmp_path / "receipt.json", out=lambda *_: None)
 
 
+def test_sign_leaves_a_signed_statement_in_the_pack(tmp_path, cosign_key):
+    """The statement lets any verifier see what the co-signer signed."""
+    pack = tmp_path / "pack"
+    aiopt = _unsealed(pack)
+    c.sign(pack, cosign_key, tmp_path / "r.json", assume_yes=True, out=lambda *_: None)
+    stmt = json.loads((pack / "cosign_statement.json").read_text())
+    core = {k: v for k, v in stmt.items() if k != "statement_signature"}
+    mine = c.load_private_key(cosign_key).public_key()
+    mine.verify(base64.b64decode(stmt["statement_signature"]), _canon(core))
+    assert core["schema"] == c.STATEMENT_SCHEMA
+    assert core["record_count"] == 3 and core["head_hash"] == _records(pack)[-1]["record_hash"]
+    assert core["pubkey_fingerprint"] == c.fingerprint(aiopt.public_key())
+    assert core["cosigner_fingerprint"] == c.fingerprint(mine)
+
+
+def test_check_reports_a_missing_or_changed_statement(tmp_path, cosign_key):
+    pack = tmp_path / "pack"
+    _unsealed(pack)
+    c.sign(pack, cosign_key, tmp_path / "r.json", assume_yes=True, out=lambda *_: None)
+    _seal_like_aiopt(pack)
+    assert c.check(pack, tmp_path / "r.json", out=lambda *_: None)
+    stmt = json.loads((pack / "cosign_statement.json").read_text())
+    stmt["record_count"] = 2
+    (pack / "cosign_statement.json").write_text(json.dumps(stmt))
+    assert not c.check(pack, tmp_path / "r.json", out=lambda *_: None)
+    (pack / "cosign_statement.json").unlink()
+    assert not c.check(pack, tmp_path / "r.json", out=lambda *_: None)
+
+
 def test_cli_exit_codes(tmp_path, cosign_key):
     pack = tmp_path / "pack"
     _unsealed(pack)
