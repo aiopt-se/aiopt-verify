@@ -42,7 +42,7 @@ except ImportError:
     sys.stderr.write("aiopt-verify needs the 'cryptography' package: pip install cryptography\n")
     sys.exit(2)
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 SCHEMA = "aiopt_evidence_pack_v1"
 STATEMENT_SCHEMA = "aiopt_cosign_statement_v1"
@@ -112,7 +112,6 @@ def inspect_pack(pack_dir, expect_keys=(), expect_cosigners=(), require_two_part
         if not check(f"present:{f.name}", f.exists(), str(f)):
             return report()
 
-    raw = ledger_path.read_bytes()
     manifest = json.loads(manifest_path.read_text())
     pub = serialization.load_pem_public_key(pubkey_path.read_bytes())
 
@@ -151,32 +150,47 @@ def inspect_pack(pack_dir, expect_keys=(), expect_cosigners=(), require_two_part
               f"the pack is co-signed by {keys['cosigner_key'][:16]}…, "
               "which is not an expected co-signer")
 
-    # per-record: chain linkage, seq monotonicity, record hash, signature(s)
-    records = [json.loads(x) for x in raw.decode("utf-8").splitlines() if x.strip()]
-    prev = ZERO_HASH
-    chain_ok = seq_ok = rhash_ok = sig_ok = True
+    # per-record: chain linkage, seq monotonicity, record hash, signature(s).
+    # The ledger is read one line at a time, so a pack of any size verifies in
+    # constant memory; the whole-file digest is built along the way.
+    count, prev, head = 0, ZERO_HASH, ZERO_HASH
+    parse_ok = chain_ok = seq_ok = rhash_ok = sig_ok = True
     actor_sig_ok = True
-    for i, rec in enumerate(records):
-        core = {k: rec[k] for k in ("seq", "timestamp", "kind", "payload", "prev_hash")}
-        if rec["prev_hash"] != prev:
-            chain_ok = False
-        if rec["seq"] != i:
-            seq_ok = False
-        core_bytes = canon(core)
-        rh = sha256_hex(core_bytes)
-        if rh != rec["record_hash"]:
-            rhash_ok = False
-        try:
-            pub.verify(base64.b64decode(rec["signature"]), core_bytes)
-        except (InvalidSignature, Exception):
-            sig_ok = False
-        if actor_pub is not None:
+    digest = hashlib.sha256()
+    with open(ledger_path, "rb") as fh:
+        for line in fh:
+            digest.update(line)
+            if not line.strip():
+                continue
+            i = count
+            count += 1
             try:
-                actor_pub.verify(base64.b64decode(rec["actor_signature"]), core_bytes)
-            except (InvalidSignature, KeyError, Exception):
-                actor_sig_ok = False
-        prev = rec["record_hash"]
-    check("record_count>0", len(records) > 0, str(len(records)))
+                rec = json.loads(line)
+                core = {k: rec[k] for k in ("seq", "timestamp", "kind", "payload", "prev_hash")}
+            except (ValueError, KeyError, TypeError):
+                parse_ok = chain_ok = False
+                continue
+            if rec["prev_hash"] != prev:
+                chain_ok = False
+            if rec["seq"] != i:
+                seq_ok = False
+            core_bytes = canon(core)
+            rh = sha256_hex(core_bytes)
+            if rh != rec.get("record_hash"):
+                rhash_ok = False
+            try:
+                pub.verify(base64.b64decode(rec["signature"]), core_bytes)
+            except (InvalidSignature, Exception):
+                sig_ok = False
+            if actor_pub is not None:
+                try:
+                    actor_pub.verify(base64.b64decode(rec["actor_signature"]), core_bytes)
+                except (InvalidSignature, KeyError, Exception):
+                    actor_sig_ok = False
+            prev = head = str(rec.get("record_hash"))
+    ledger_sha = digest.hexdigest()
+    check("record_count>0", count > 0, str(count))
+    check("ledger_parse", parse_ok, "a line of ledger.jsonl is not a record")
     check("chain_linkage", chain_ok)
     check("seq_monotonic", seq_ok)
     check("record_hashes", rhash_ok)
@@ -186,12 +200,11 @@ def inspect_pack(pack_dir, expect_keys=(), expect_cosigners=(), require_two_part
 
     # manifest anchors: count, head, whole-ledger digest. This is what catches
     # truncation (deleting the last record) that a plain chain would miss
-    check("manifest_count", manifest.get("record_count") == len(records),
-          f"manifest={manifest.get('record_count')} actual={len(records)}")
-    head = records[-1]["record_hash"] if records else ZERO_HASH
+    check("manifest_count", manifest.get("record_count") == count,
+          f"manifest={manifest.get('record_count')} actual={count}")
     check("manifest_head", manifest.get("head_hash") == head)
-    check("manifest_last_seq", manifest.get("last_seq") == (len(records) - 1))
-    check("ledger_digest", manifest.get("ledger_sha256") == sha256_hex(raw))
+    check("manifest_last_seq", manifest.get("last_seq") == (count - 1))
+    check("ledger_digest", manifest.get("ledger_sha256") == ledger_sha)
 
     # the co-signer's own statement of what it signed: record count, head and
     # ledger digest, signed with its key. The manifest is AIOpt's alone, so this
@@ -201,7 +214,7 @@ def inspect_pack(pack_dir, expect_keys=(), expect_cosigners=(), require_two_part
         if statement_path.exists():
             ok, detail = _check_statement(
                 json.loads(statement_path.read_text()), actor_pub, fp,
-                keys["cosigner_key"], len(records), head, sha256_hex(raw))
+                keys["cosigner_key"], count, head, ledger_sha)
             check("cosigner_statement", ok, detail)
         elif strict_two_party:
             check("cosigner_statement", False,

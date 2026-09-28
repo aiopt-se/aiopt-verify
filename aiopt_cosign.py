@@ -46,6 +46,8 @@ except ImportError:
     sys.stderr.write("aiopt-cosign needs the 'cryptography' package: pip install cryptography\n")
     sys.exit(2)
 
+__version__ = "1.2.0"
+
 ZERO_HASH = "0" * 64
 RECEIPT_SCHEMA = "aiopt_cosign_receipt_v1"
 STATEMENT_SCHEMA = "aiopt_cosign_statement_v1"
@@ -101,8 +103,31 @@ def keygen(path):
     return fingerprint(key.public_key())
 
 
-def read_unsealed(pack):
-    """Check every record before anything is signed. Returns (records, AIOpt key)."""
+def iter_records(pack):
+    """Records of ledger.jsonl one at a time, so a pack of any size is handled
+    in constant memory."""
+    with (pack / "ledger.jsonl").open("rb") as fh:
+        for n, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except ValueError:
+                raise Refused(f"line {n} of ledger.jsonl is not a record")
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_unsealed(pack, cosigner_pub=None):
+    """Check every record before anything is signed, one at a time. Returns
+    (facts about the ledger, AIOpt's key). With `cosigner_pub`, a record
+    already co-signed by another key is refused."""
     if (pack / "manifest.json").exists():
         raise Refused("this pack is already sealed; co-signing must happen before sealing")
     for name in ("ledger.jsonl", "pubkey.pem"):
@@ -111,12 +136,10 @@ def read_unsealed(pack):
     system_pub = serialization.load_pem_public_key((pack / "pubkey.pem").read_bytes())
     if not isinstance(system_pub, Ed25519PublicKey):
         raise Refused("pubkey.pem is not an Ed25519 key")
-    lines = (pack / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
-    records = [json.loads(x) for x in lines if x.strip()]
-    if not records:
-        raise Refused("the ledger is empty")
+    facts = {"count": 0, "first_ts": None, "last_ts": None, "head": ZERO_HASH,
+             "kinds": Counter(), "verdicts": Counter()}
     prev = ZERO_HASH
-    for i, rec in enumerate(records):
+    for i, rec in enumerate(iter_records(pack)):
         if rec.get("seq") != i or rec.get("prev_hash") != prev:
             raise Refused(f"record {i}: the hash chain is broken")
         body = core_bytes(rec)
@@ -126,53 +149,65 @@ def read_unsealed(pack):
             system_pub.verify(base64.b64decode(rec["signature"]), body)
         except (InvalidSignature, KeyError, ValueError):
             raise Refused(f"record {i}: the signature from pubkey.pem does not verify")
+        if cosigner_pub is not None and "actor_signature" in rec:
+            try:
+                cosigner_pub.verify(base64.b64decode(rec["actor_signature"]), body)
+            except (InvalidSignature, ValueError):
+                raise Refused(f"record {i} is already co-signed by a different key")
         prev = rec["record_hash"]
-    return records, system_pub
+        facts["count"] += 1
+        facts["head"] = prev
+        facts["first_ts"] = facts["first_ts"] or rec.get("timestamp")
+        facts["last_ts"] = rec.get("timestamp")
+        facts["kinds"][rec.get("kind")] += 1
+        payload = rec.get("payload")
+        if isinstance(payload, dict) and payload.get("verdict"):
+            facts["verdicts"][payload["verdict"]] += 1
+    if not facts["count"]:
+        raise Refused("the ledger is empty")
+    return facts, system_pub
 
 
-def summary(records):
-    kinds = Counter(r["kind"] for r in records)
-    verdicts = Counter(
-        r["payload"].get("verdict") for r in records
-        if isinstance(r.get("payload"), dict) and r["payload"].get("verdict"))
-    lines = [f"  records: {len(records)}  "
-             f"({records[0]['timestamp']} to {records[-1]['timestamp']})"]
-    lines += [f"  kind {k}: {n}" for k, n in sorted(kinds.items())]
-    lines += [f"  verdict {v}: {n}" for v, n in sorted(verdicts.items())]
+def summary(facts):
+    lines = [f"  records: {facts['count']}  ({facts['first_ts']} to {facts['last_ts']})"]
+    lines += [f"  kind {k}: {n}" for k, n in sorted(facts["kinds"].items())]
+    lines += [f"  verdict {v}: {n}" for v, n in sorted(facts["verdicts"].items())]
     return "\n".join(lines)
 
 
 def sign(pack, key_path, receipt_path=None, assume_yes=False, out=print):
     pack = Path(pack)
-    records, system_pub = read_unsealed(pack)
     key = load_private_key(key_path)
     pub = key.public_key()
+    facts, system_pub = read_unsealed(pack, cosigner_pub=pub)
     if fingerprint(pub) == fingerprint(system_pub):
         raise Refused("your key is the same key that signed the records; "
                       "a co-signature must come from a different party")
-    for i, rec in enumerate(records):
-        if "actor_signature" in rec:
-            try:
-                pub.verify(base64.b64decode(rec["actor_signature"]), core_bytes(rec))
-            except (InvalidSignature, ValueError):
-                raise Refused(f"record {i} is already co-signed by a different key")
 
-    out(f"Pack: {pack}\n{summary(records)}\n"
+    out(f"Pack: {pack}\n{summary(facts)}\n"
         f"  signed by key {fingerprint(system_pub)[:16]}...\n"
         f"  you co-sign with key {fingerprint(pub)[:16]}...")
     if not assume_yes:
         try:
-            answer = input(f"Co-sign all {len(records)} records? [y/N] ").strip().lower()
+            answer = input(f"Co-sign all {facts['count']} records? [y/N] ").strip().lower()
         except EOFError:
             answer = ""
         if answer not in ("y", "yes"):
             raise Refused("not confirmed; nothing was signed")
 
-    for rec in records:
-        rec["actor_signature"] = base64.b64encode(key.sign(core_bytes(rec))).decode("ascii")
-    body = "".join(json.dumps(r, sort_keys=True) + "\n" for r in records).encode("utf-8")
+    # Second pass: co-sign each record as it streams into a new file, then
+    # swap the files. Nothing is held but one record and the running digest.
+    digest = hashlib.sha256()
     tmp = pack / "ledger.jsonl.tmp"
-    tmp.write_bytes(body)
+    count, head = 0, ZERO_HASH
+    with tmp.open("wb") as fh:
+        for rec in iter_records(pack):
+            rec["actor_signature"] = base64.b64encode(key.sign(core_bytes(rec))).decode("ascii")
+            line = (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8")
+            digest.update(line)
+            fh.write(line)
+            count += 1
+            head = rec["record_hash"]
     os.replace(tmp, pack / "ledger.jsonl")
     (pack / "pubkey_actor.pem").write_bytes(pub.public_bytes(
         encoding=serialization.Encoding.PEM,
@@ -180,9 +215,9 @@ def sign(pack, key_path, receipt_path=None, assume_yes=False, out=print):
 
     core = {
         "schema": RECEIPT_SCHEMA,
-        "record_count": len(records),
-        "head_hash": records[-1]["record_hash"],
-        "ledger_sha256": sha256_hex(body),
+        "record_count": count,
+        "head_hash": head,
+        "ledger_sha256": digest.hexdigest(),
         "pubkey_fingerprint": fingerprint(system_pub),
         "cosigner_fingerprint": fingerprint(pub),
     }
@@ -194,7 +229,7 @@ def sign(pack, key_path, receipt_path=None, assume_yes=False, out=print):
     receipt = {**core, "receipt_signature": base64.b64encode(key.sign(canon(core))).decode("ascii")}
     rp = Path(receipt_path or f"aiopt_cosign_receipt_{core['head_hash'][:12]}.json")
     rp.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-    out(f"Co-signed {len(records)} records. Receipt: {rp} (keep it; do not send it back)")
+    out(f"Co-signed {count} records. Receipt: {rp} (keep it; do not send it back)")
     return receipt
 
 
@@ -223,7 +258,7 @@ def check(pack, receipt_path, out=print):
     item("same_record_count", manifest.get("record_count") == receipt.get("record_count"))
     item("same_head_hash", manifest.get("head_hash") == receipt.get("head_hash"))
     item("same_ledger", manifest.get("ledger_sha256") == receipt.get("ledger_sha256")
-         and sha256_hex((pack / "ledger.jsonl").read_bytes()) == receipt.get("ledger_sha256"))
+         and file_sha256(pack / "ledger.jsonl") == receipt.get("ledger_sha256"))
     stmt_path = pack / "cosign_statement.json"
     stmt = json.loads(stmt_path.read_text()) if stmt_path.exists() else {}
     stmt_core = {k: v for k, v in stmt.items() if k != "statement_signature"}

@@ -214,3 +214,32 @@ def test_tool_is_standalone_and_offline():
     # stdlib plus cryptography: no AIOpt code, nothing that talks to a network
     assert imported <= {"argparse", "base64", "hashlib", "json", "os", "sys",
                         "collections", "pathlib", "getpass", "cryptography"}, imported
+
+
+# ---------------------------------------------------------------- streaming (1.2)
+def test_a_large_pack_is_cosigned_in_constant_memory(tmp_path, cosign_key):
+    import resource
+    import sys
+
+    pack = tmp_path / "pack"
+    _unsealed(pack, n=20_000)
+    size_mb = (pack / "ledger.jsonl").stat().st_size / 1e6
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    receipt = c.sign(pack, cosign_key, tmp_path / "r.json", assume_yes=True, out=lambda *_: None)
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    scale = 1024 * 1024 if sys.platform == "darwin" else 1024
+    assert receipt["record_count"] == 20_000
+    assert (after - before) / scale < max(30, size_mb), "the tool loaded the ledger"
+    _seal_like_aiopt(pack)
+    assert c.check(pack, tmp_path / "r.json", out=lambda *_: None)
+
+
+def test_a_corrupt_line_is_refused_before_signing(tmp_path, cosign_key):
+    pack = tmp_path / "pack"
+    _unsealed(pack)
+    lines = (pack / "ledger.jsonl").read_text().splitlines()
+    lines[1] = "{not a record"
+    (pack / "ledger.jsonl").write_text("\n".join(lines) + "\n")
+    with pytest.raises(c.Refused, match="not a record"):
+        c.sign(pack, cosign_key, tmp_path / "r.json", assume_yes=True, out=lambda *_: None)
+    assert "actor_signature" not in (pack / "ledger.jsonl").read_text()

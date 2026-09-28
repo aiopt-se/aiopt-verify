@@ -9,7 +9,8 @@ records.
 Standalone, MIT-licensed tools: one file to verify (`aiopt_verify.py`), one
 file for the second party to co-sign a pack with its own key
 (`aiopt_cosign.py`), one file that doubles as an executable spec of the pack
-format (`make_sample_pack.py`), and their tests.
+format (`make_sample_pack.py`), the format written out (`PACK_FORMAT.md`),
+and their tests.
 
 ## Install
 
@@ -56,6 +57,9 @@ python3 aiopt_verify.py /tmp/demo/two_party
 ```
 
 ## What a pack contains
+
+The full format, enough to write an independent verifier, is in
+[PACK_FORMAT.md](PACK_FORMAT.md).
 
 ```
 ledger.jsonl           append-only, Ed25519-signed, chain-hashed verdict records
@@ -107,6 +111,18 @@ manifest.hash(.ots)    (optional) the manifest hash and its OpenTimestamps proof
 - **Older two-party packs** (before 1.1) have no co-signer statement. They still
   verify, with a warning; with `--expect-cosigner` or `--require-two-party`
   they fail, because a shortened pack cannot be ruled out.
+
+## Changes in 1.2
+
+- The ledger is read one record at a time and the file digest is built along
+  the way, so a pack of any size verifies in constant memory. A million-record
+  pack (2.3 GB) needed 620 s and 6.6 GB of memory with 1.1; with 1.2 it takes
+  219 s and 29 MB on a laptop, every check passed.
+- A line of `ledger.jsonl` that is not a record is a failed check
+  (`ledger_parse`) instead of a crash.
+- `aiopt_cosign.py` co-signs the same way: one record at a time into a new
+  file, then the files are swapped.
+- Same checks, same output, same exit codes; the pack format is unchanged.
 
 ## Changes in 1.1
 

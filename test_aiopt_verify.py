@@ -262,8 +262,36 @@ def test_cli_pins_file_json_and_bad_fingerprint(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     out = json.loads(res.stdout)
     assert out["keys"]["aiopt_key"] == _fingerprint(op.public_key())
-    assert out["warnings"] == [] and out["verifier"].startswith("aiopt-verify 1.1")
+    assert out["warnings"] == [] and out["verifier"].startswith("aiopt-verify 1.2")
 
     wrong = _cli(pack, "--expect-cosigner", _fingerprint(op.public_key()))
     assert wrong.returncode == 1 and "pinned_cosigner" in wrong.stdout
     assert _cli(pack, "--expect-key", "abc123").returncode == 2
+
+
+# ---------------------------------------------------------------- streaming (1.2)
+def test_a_corrupt_line_is_a_failed_check_not_a_crash(tmp_path):
+    build_pack(tmp_path, n=3)
+    lines = (tmp_path / "ledger.jsonl").read_text().splitlines()
+    lines[1] = "{not a record"
+    (tmp_path / "ledger.jsonl").write_text("\n".join(lines) + "\n")
+    ok, checks = v.verify_pack(str(tmp_path))
+    assert not ok
+    assert "ledger_parse" in _failed(checks) and "chain_linkage" in _failed(checks)
+
+
+def test_a_large_pack_verifies_in_constant_memory(tmp_path):
+    """Twenty thousand records (about 10 MB): the process must not grow by
+    anything like the pack's size. Peak RSS comes from the OS, so this is a
+    bound on the whole process."""
+    import resource
+    import sys
+
+    build_pack(tmp_path, two_party=True, n=20_000)
+    size_mb = (tmp_path / "ledger.jsonl").stat().st_size / 1e6
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    ok, checks = v.verify_pack(str(tmp_path))
+    after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    scale = 1024 * 1024 if sys.platform == "darwin" else 1024
+    assert ok, _failed(checks)
+    assert (after - before) / scale < max(30, size_mb), "the verifier loaded the ledger"
